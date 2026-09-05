@@ -2,20 +2,20 @@ package cache
 
 // MinHeap struct has a slice that holds the array
 type MinHeap struct {
-	slice []int
+	slice []*HeapNode
 }
 
 // Inserts adds an element to the heap
-func (h *MinHeap) Insert(key int) {
+func (h *MinHeap) Insert(key *HeapNode) {
 	h.slice = append(h.slice, key)
 	h.minHeapifyUp(len(h.slice) - 1)
 }
 
 // Extract returns the smallest key, and removes it from the heap.
-func (h *MinHeap) Extract() (int, bool) {
+func (h *MinHeap) Extract() (*HeapNode, bool) {
 	// cannot extract from an empty heap
 	if len(h.slice) == 0 {
-		return 0, false
+		return nil, false
 	}
 
 	extracted := h.slice[0]
@@ -42,7 +42,7 @@ func (h *MinHeap) minHeapifyUp(index int) {
 	for index > 0 {
 		p := parent(index)
 
-		if h.slice[p] <= h.slice[index] {
+		if !h.slice[index].LastUsed.Before(h.slice[p].LastUsed) {
 			return
 		}
 
@@ -67,13 +67,13 @@ func (h *MinHeap) minHeapifyDown(index int) {
 		childToCompare := l
 
 		// when the right child exists, compare both children
-		if r < n && h.slice[r] < h.slice[l] {
+		if r < n && h.slice[r].LastUsed.Before(h.slice[l].LastUsed) {
 			childToCompare = r
 		}
 
 		// compare slice value of current index to smaller child
 		// and swap if current value is larger
-		if h.slice[index] <= h.slice[childToCompare] {
+		if !h.slice[childToCompare].LastUsed.Before(h.slice[index].LastUsed) {
 			return
 		}
 
@@ -100,4 +100,7 @@ func right(i int) int {
 // swap keys in the array
 func (h *MinHeap) swap(i1, i2 int) {
 	h.slice[i1], h.slice[i2] = h.slice[i2], h.slice[i1]
+
+	h.slice[i1].HeapIndex = i1
+	h.slice[i2].HeapIndex = i2
 }
