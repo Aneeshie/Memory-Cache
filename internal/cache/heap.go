@@ -8,6 +8,7 @@ type MinHeap struct {
 // Inserts adds an element to the heap
 func (h *MinHeap) Insert(key *HeapNode) {
 	h.slice = append(h.slice, key)
+	key.HeapIndex = len(h.slice) - 1
 	h.minHeapifyUp(len(h.slice) - 1)
 }
 
@@ -31,6 +32,8 @@ func (h *MinHeap) Extract() (*HeapNode, bool) {
 	h.slice[0] = h.slice[n]
 
 	h.slice = h.slice[:n]
+
+	h.slice[0].HeapIndex = 0
 
 	h.minHeapifyDown(0)
 
