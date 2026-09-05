@@ -82,6 +82,10 @@ func (h *MinHeap) minHeapifyDown(index int) {
 	}
 }
 
+func (h *MinHeap) FixDown(index int) {
+	h.minHeapifyDown(index)
+}
+
 // get the parent
 func parent(i int) int {
 	return (i - 1) / 2
