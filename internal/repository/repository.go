@@ -23,7 +23,7 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 
 func (r *Repository) CreateCachedEntry(ctx context.Context, entry *domain.CachedEntry) error {
 	query := `INSERT INTO cache_entries (key, data, created_at, updated_at)
-	VALUES($1,$2,$3)
+	VALUES($1,$2,$3,$4)
 	ON CONFLICT (key)
 	DO UPDATE SET 
 		data = EXCLUDED.data,
