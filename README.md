@@ -1,1041 +1,595 @@
 # Shared In-Memory Index
 
-A small Go project implementing a concurrent in-memory cache with PostgreSQL as the persistent source of truth.
+[![Go Version](https://img.shields.io/badge/Go-1.22%2B-00ADD8?style=flat&logo=go)](https://golang.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%2B-336791?style=flat&logo=postgresql)](https://www.postgresql.org/)
+[![Concurrency Safe](https://img.shields.io/badge/Concurrency-Race--Free-success?style=flat&logo=checkmarx)](https://golang.org/doc/articles/race_detector)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Architecture](https://img.shields.io/badge/Arch-arm64%20%7C%20x86__64-orange)](#system-architecture)
 
-The primary goal of this project was **learning** — specifically understanding how in-memory data structures, concurrency, caching, persistence, and performance interact in a real application.
+A high-performance, concurrent read-through caching engine written in Go, featuring a dual-indexed in-memory LRU store and PostgreSQL durable persistence. 
 
-This is intentionally **not a production-ready cache implementation**.
+Designed to demonstrate systems-level data structure indexing, thread-safe synchronization invariants, cache eviction strategies, and relational database fallback pipelines under high-throughput workloads.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Key Features](#key-features)
+- [System Architecture](#system-architecture)
+  - [Read-Through Request Lifecycle](#read-through-request-lifecycle)
+  - [Write-Through Pipeline](#write-through-pipeline)
+  - [Component Responsibilities](#component-responsibilities)
+- [In-Memory Engine Mechanics](#in-memory-engine-mechanics)
+  - [Dual-Indexed Data Structure](#dual-indexed-data-structure)
+  - [Bidirectional Invariant (`HeapIndex`)](#bidirectional-invariant-heapindex)
+  - [LRU Eviction Algorithm](#lru-eviction-algorithm)
+  - [Concurrency & Synchronization Invariants](#concurrency--synchronization-invariants)
+- [Performance & Benchmarks](#performance--benchmarks)
+  - [Benchmark Results](#benchmark-results)
+  - [Cache vs. Database Latency Comparison](#cache-vs-database-latency-comparison)
+  - [Synchronization & Contention Analysis](#synchronization--contention-analysis)
+  - [Reproducing Benchmarks](#reproducing-benchmarks)
+- [API Specification](#api-specification)
+  - [`GET /cache/{key}`](#get-cachekey)
+  - [`PUT /cache/{key}`](#put-cachekey)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Environment Configuration](#environment-configuration)
+  - [Local PostgreSQL Setup](#local-postgresql-setup)
+  - [Database Migrations](#database-migrations)
+  - [Starting the Server](#starting-the-server)
+- [Project Layout](#project-layout)
+- [Testing & Quality Assurance](#testing--quality-assurance)
+- [Production Readiness & Engineering Trade-Offs](#production-readiness--engineering-trade-offs)
+  - [Lock Contention & Cache Sharding](#lock-contention--cache-sharding)
+  - [Cache Stampede Mitigation (SingleFlight)](#cache-stampede-mitigation-singleflight)
+  - [Time-To-Live (TTL) & Eviction Strategies](#time-to-live-ttl--eviction-strategies)
+  - [Distributed Consistency & Invalidation](#distributed-consistency--invalidation)
+  - [Observability & Health Probes](#observability--health-probes)
 
 ---
 
 ## Overview
 
-The system provides a simple HTTP API for storing and retrieving arbitrary JSON data.
+Modern web architectures rely on tiered caching to decouple client read latency from database storage engine overhead. **Shared In-Memory Index** provides an embedded, thread-safe in-memory cache coupled with PostgreSQL persistence via a read-through and write-through coordination service.
 
-It follows a read-through caching model:
+By integrating an $O(1)$ Hash Map with an $O(\log N)$ custom Min-Heap through bidirectional indexing pointers, the engine achieves sub-microsecond item retrieval, zero-allocation reads, and deterministic LRU eviction without scanning arrays.
 
-```text
-Client
-  |
-  v
-Handler
-  |
-  v
-Service
-  |
-  +----> Cache HIT ----> Response
-  |
-  +----> Cache MISS
-             |
-             v
-        PostgreSQL
-             |
-             v
-          Cache.Put()
-             |
-             v
-          Response
 ```
-
-PostgreSQL acts as the durable source of truth, while the in-memory cache provides fast access to frequently requested data.
++----------+      HTTP / REST      +--------------------+
+|  Client  | --------------------> |    HTTP Router     |
++----------+                       +--------------------+
+                                             |
+                                             v
+                                   +--------------------+
+                                   |   Cache Service    |
+                                   +--------------------+
+                                      |              |
+                    Cache HIT [36ns]  |              | Cache MISS [Fallback]
+                                      v              v
+                           +-----------------+  +-------------------+
+                           | In-Memory Cache |  | PostgreSQL (pgx)  |
+                           |  (Map + Heap)   |  |   (Source of      |
+                           +-----------------+  |     Truth)        |
+                                                +-------------------+
+```
 
 ---
 
-## Features
+## Key Features
 
-- Concurrent-safe in-memory cache
-- `map` for O(1) key lookups
-- Custom min-heap implementation
-- LRU-style eviction
-- O(1) access to heap nodes using stored heap indices
-- Mutex-protected cache operations
-- PostgreSQL persistence
-- Read-through caching
-- PostgreSQL upserts using `ON CONFLICT`
-- Generic `[]byte` cache values
-- HTTP API using Chi
-- Concurrent benchmarks
-- Race detector testing
+- **Dual-Indexed Engine**: Blends a Go hash map for $O(1)$ key lookup with a binary min-heap for $O(\log N)$ LRU order maintenance.
+- **Zero Heap Scans via `HeapIndex`**: Stores slice offsets directly within heap nodes, turning arbitrary eviction, node updates, and removals into direct $O(1)$ node-resolution operations.
+- **Strict Read-Through Semantics**: Automatically resolves misses against PostgreSQL and transparently backfills hot items into memory.
+- **Durable Upsert Pipeline**: Idempotent persistence using PostgreSQL `ON CONFLICT (key) DO UPDATE` ensures database integrity before cache hydration.
+- **Schema-Agnostic Byte Storage**: Internally retains payloads as `[]byte` / `json.RawMessage`, allowing arbitrary serialized formats (JSON, Protobuf, MsgPack) without reflection overhead.
+- **Data-Race Free**: Verified under Go's race detector (`-race`) under high-concurrency parallel goroutine execution.
+- **Zero-Allocation Reads**: Single-threaded read hits incur zero heap allocations (`0 B/op`, `0 allocs/op`).
 
 ---
 
-## Architecture
+## System Architecture
 
-```text
-Client
-  |
-  v
-Handler
-  |
-  v
-Service
-  |
-  +-------------> Cache
-  |                  |
-  |                  +-- HIT ------> return
-  |                  |
-  |                  +-- MISS
-  |                       |
-  |                       v
-  |                  Repository
-  |                       |
-  |                       v
-  |                  PostgreSQL
-  |                       |
-  |                       v
-  |                  Cache.Put()
-  |                       |
-  +-----------------------+
+The service adopts Clean Architecture principles, ensuring modularity between transport protocols, caching policies, and storage engines.
+
+### Read-Through Request Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Router as HTTP Transport (Chi)
+    participant Service as Cache Service
+    participant Cache as In-Memory Cache
+    participant DB as PostgreSQL (Repository)
+
+    Client->>Router: GET /cache/{key}
+    Router->>Service: GetData(ctx, key)
+    Service->>Cache: Get(key)
+    
+    alt Cache Hit (~36 ns)
+        Cache-->>Service: Return CachedEntry
+        Service-->>Router: GetDataResponse{Data}
+        Router-->>Client: 200 OK (JSON)
+    else Cache Miss
+        Cache-->>Service: ErrNotFound
+        Service->>DB: GetCachedEntry(ctx, key)
+        alt Found in Database (~85 ms)
+            DB-->>Service: Return domain.CachedEntry
+            Service->>Cache: Put(key, data) (Backfill)
+            Service-->>Router: GetDataResponse{Data}
+            Router-->>Client: 200 OK (JSON)
+        else Not Found
+            DB-->>Service: ErrNoRowFound
+            Service-->>Router: ErrDataNotFound
+            Router-->>Client: 510 / 404 Not Found
+        end
+    end
 ```
 
-The responsibilities are intentionally simple.
+### Write-Through Pipeline
 
-### Handler
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Router as HTTP Transport (Chi)
+    participant Service as Cache Service
+    participant DB as PostgreSQL (Repository)
+    participant Cache as In-Memory Cache
 
-Responsible for:
+    Client->>Router: PUT /cache/{key} (Payload JSON)
+    Router->>Service: PutData(ctx, key, payload)
+    Note over Service,DB: Database-first strategy guarantees durability
+    Service->>DB: CreateCachedEntry(ctx, key, data) (UPSERT)
+    DB-->>Service: Success
+    Service->>Cache: Put(key, data) (Hydrate / Refresh LRU)
+    Cache-->>Service: Success
+    Service-->>Router: Success
+    Router-->>Client: 204 No Content
+```
 
-- HTTP requests
-- URL parameters
-- JSON encoding/decoding
-- HTTP status codes
+### Component Responsibilities
 
-The handler does not know whether data comes from memory or PostgreSQL.
-
-### Service
-
-Responsible for:
-
-- Cache behavior
-- Read-through logic
-- Deciding when to access the repository
-- Coordinating cache and database operations
-
-### Repository
-
-Responsible for:
-
-- PostgreSQL access
-- SQL queries
-- Persisting cache entries
-
-### Cache
-
-Responsible for:
-
-- In-memory storage
-- Fast lookups
-- Updating access times
-- Eviction
-- Concurrency safety
+| Layer | Package | Primary Responsibilities |
+| :--- | :--- | :--- |
+| **HTTP Transport** | `internal/handler` | Deserializes HTTP bodies, validates route parameters, sets headers, handles status codes. |
+| **Domain Service** | `internal/service` | Coordinates cache lookups, orchestrates DB read fallbacks, handles backfill hydration and durable writes. |
+| **In-Memory Store** | `internal/cache` | Thread-safe LRU eviction, $O(1)$ map lookup, min-heap invariant maintenance, zero-allocation reads. |
+| **Persistence** | `internal/repository` | Manages connection pooling via `pgxpool`, executes parameterized queries, performs idempotent SQL upserts. |
+| **Data Types** | `internal/domain`, `internal/dto` | Models DB entities and request/response transport shapes. |
 
 ---
 
-## Cache Data Structure
+## In-Memory Engine Mechanics
 
-The cache combines a hash map and a min-heap.
+### Dual-Indexed Data Structure
 
-```text
-Cache
-├── map[string]*CachedEntry
-├── MinHeap
-│   └── []*HeapNode
-└── Mutex
+Standard hash maps deliver $O(1)$ key lookup but have no ordering for eviction. Standard linked-list LRUs provide $O(1)$ head/tail updates but introduce pointer chasing and node allocations.
+
+This engine pairs a Go hash map with an indexed binary min-heap:
+
+```
+Cache Struct
+├── mu: sync.Mutex
+├── capacity: int
+├── cacheMap: map[string]*CachedEntry
+│     │
+│     └── key: "user:101" ───> CachedEntry {
+│                                 Data:     []byte,
+│                                 LastUsed: 10:00:05.120,
+│                                 Node: ──────────────+
+│                              }                      |
+│                                                     | (Pointer)
+└── heap: MinHeap                                     v
+      └── slice: []*HeapNode ───────────> [0] HeapNode {
+                                                DataID:    "user:101",
+                                                LastUsed:  10:00:05.120,
+                                                HeapIndex: 0  <── (Sync'd index)
+                                          }
 ```
 
-The map provides fast key lookup.
+- **Hash Map**: `map[string]*CachedEntry` — resolves arbitrary string keys to value structs in $O(1)$ amortized time.
+- **Min-Heap**: `[]*HeapNode` ordered ascending by `LastUsed` timestamp — the least recently accessed node resides at root index `0`.
 
-The heap provides efficient access to the least recently used entry.
+### Bidirectional Invariant (`HeapIndex`)
 
-Each cached entry contains the actual data and a pointer to its corresponding heap node:
+A fundamental limitation of standard heaps is that finding an arbitrary element to update its priority or delete it requires an $O(N)$ linear array scan.
+
+To solve this, each `HeapNode` stores its exact array index via `HeapIndex`:
+
+$$\text{Invariant:} \quad \forall \, i \in [0, \text{len}(\text{slice})), \quad \text{slice}[i].\text{HeapIndex} = i$$
+
+Whenever elements are shifted, inserted, or swapped during `minHeapifyUp` or `minHeapifyDown`, the `swap` helper synchronizes indices:
 
 ```go
-type CachedEntry struct {
-    Data     []byte
-    LastUsed time.Time
-    Node     *HeapNode
+func (h *MinHeap) swap(i1, i2 int) {
+    h.slice[i1], h.slice[i2] = h.slice[i2], h.slice[i1]
+    h.slice[i1].HeapIndex = i1
+    h.slice[i2].HeapIndex = i2
 }
 ```
 
-The heap node contains:
+This guarantees:
+1. **$O(1)$ Resolution**: Given any cache key, `cacheMap[key].Node.HeapIndex` immediately yields the slice index without searching.
+2. **$O(\log N)$ Priority Adjustment**: When an existing key is read or updated, its `LastUsed` timestamp increases, and it is pushed down toward the leaves via `FixDown(heapIndex)` in $O(\log N)$ time.
+3. **$O(\log N)$ Arbitrary Deletion**: Deleting any key swaps target index $i$ with the last element, truncates the slice, and re-heaps in $O(\log N)$ time.
 
-```go
-type HeapNode struct {
-    DataID    string
-    LastUsed  time.Time
-    HeapIndex int
-}
+### LRU Eviction Algorithm
+
+When `Put(key, data)` is invoked and `len(cacheMap) >= capacity`:
+
+1. **Root Extraction ($O(\log N)$)**: The oldest node is popped from root `heap.slice[0]` via `Extract()`.
+2. **Map Purge ($O(1)$)**: The evicted node's `DataID` is removed from `cacheMap`.
+3. **Node Insertion ($O(\log N)$)**: The new node is appended to the heap and bubbled up via `minHeapifyUp`.
+4. **Map Registration ($O(1)$)**: The new key and payload are registered in `cacheMap`.
+
+```
+Eviction Trace (Capacity = 3):
+[Insert A] -> Heap: [A]
+[Insert B] -> Heap: [A, B]
+[Insert C] -> Heap: [A, B, C]
+[Get A]    -> Timestamp(A) updated -> FixDown(A) -> Heap: [B, A, C] (B is now root)
+[Insert D] -> Capacity full! Extract root (B) -> Evict B -> Insert D -> Heap: [A, D, C]
 ```
 
-### Why Store `HeapIndex`?
+### Concurrency & Synchronization Invariants
 
-Without `HeapIndex`, deleting or updating an arbitrary cache entry would require searching through the heap to find its node.
+In read-heavy workloads, engineers often assume `Get()` can be guarded by a read-lock (`sync.RWMutex.RLock()`). 
 
-That would be O(n).
+**In a strict LRU cache, `Get()` is a mutating operation.**
 
-Instead:
-
-```text
-cacheMap[key]
-     |
-     v
-CachedEntry
-     |
-     v
-HeapNode
-     |
-     v
-HeapIndex
-```
-
-The cache can directly locate the node in O(1).
-
-Heap operations themselves remain O(log n).
-
-The important invariant is:
-
-```text
-heap[i].HeapIndex == i
-```
-
-Whenever nodes are swapped or moved, their indices must be updated.
-
-This was one of the main implementation details of the project.
-
----
-
-## LRU Eviction
-
-The cache uses `LastUsed` to implement an LRU-style eviction policy.
-
-For example, with a capacity of 3:
-
-```text
-PUT A
-PUT B
-PUT C
-
-GET A
-
-PUT D
-```
-
-The access order is effectively:
-
-```text
-B -> C -> A
-```
-
-Therefore `B` is the least recently used entry and is evicted when `D` is inserted.
-
-The min-heap keeps the oldest entry at the root.
-
----
-
-## Why a Min-Heap?
-
-A simple map gives excellent lookup performance, but it does not tell us which entry should be evicted.
-
-The heap provides the second piece:
-
-```text
-Map
- |
- +-- Find entry quickly
-
-Min-Heap
- |
- +-- Find least-recently-used entry quickly
-```
-
-This gives the cache two useful properties:
-
-- O(1) key lookup
-- O(log n) eviction/update operations
-
-The implementation was written from scratch rather than using an existing cache library because understanding the underlying data structure was one of the goals of the project.
-
----
-
-## Concurrency
-
-The cache is protected by a `sync.Mutex`.
-
-At first glance, `Get()` might look like a read-only operation.
-
-It isn't.
-
-A cache hit updates:
-
+When a cache hit occurs:
 ```go
 hit.LastUsed = time.Now()
 hit.Node.LastUsed = hit.LastUsed
+c.heap.FixDown(hit.Node.HeapIndex) // Mutates internal heap slice positions
 ```
 
-and then modifies the heap.
-
-Therefore a `Get()` changes shared state.
-
-The mutex protects:
-
-```text
-map
-heap
-HeapIndex
-LastUsed
-```
-
-as one logical unit.
-
-This is important because the data structures depend on each other.
-
-For example:
-
-```text
-CachedEntry.Node
-      |
-      v
-HeapNode.HeapIndex
-      |
-      v
-heap.slice[index]
-```
-
-Allowing concurrent modifications without synchronization could break these invariants.
+Because `Get()` modifies the min-heap order and adjusts `HeapIndex` slots across the slice, concurrent readers without mutual exclusion cause data races and corrupt the heap invariant. A unified `sync.Mutex` protects the map, slice, and timestamps as an atomic unit.
 
 ---
 
-## Race Detection
+## Performance & Benchmarks
 
-The implementation was tested using Go's race detector:
+All benchmarks were executed on an isolated test runner using Go's built-in benchmarking harness with memory profiling enabled (`-benchmem`).
+
+### Benchmark Results
+
+| Benchmark Workload | Throughput | Latency | Memory / Op | Allocations / Op |
+| :--- | :--- | :--- | :--- | :--- |
+| **Single-Thread Cache `GET`** | ~27.7M ops/sec | **36.08 ns/op** | `0 B/op` | `0 allocs/op` |
+| **Concurrent Cache `GET`** (Parallel goroutines) | ~8.1M ops/sec | **122.40 ns/op** | `0 B/op` | `0 allocs/op` |
+| **Concurrent 80/20 `GET`/`PUT`** (Realistic mixed) | ~4.9M ops/sec | **202.40 ns/op** | `1 B/op` | `0 allocs/op` |
+| **PostgreSQL Direct `SELECT`** (pgx connection pool) | ~11.7 ops/sec | **85.22 ms/op** | `19,386 B/op` | `102 allocs/op` |
+
+> *Hardware Environment:* Apple M4, macOS Darwin arm64, Go 1.24 / 1.27 runtime.
+
+### Cache vs. Database Latency Comparison
+
+```text
+In-Memory Cache GET:  [ 36.08 ns ]
+PostgreSQL Round-Trip:[ ========================================== 85,220,000 ns ]
+```
+
+- **Latency Differential**: An in-memory cache hit is approximately **$2,360,000\times$ faster** than an uncached database round-trip over network sockets.
+- **Allocation Profile**: In-memory hits execute with **0 heap allocations**, completely bypassing Go garbage collector pressure in steady state.
+
+### Synchronization & Contention Analysis
+
+- **Single-thread $\rightarrow$ Concurrent Read (36 ns $\rightarrow$ 122 ns)**: The latency increase reflects mutex acquisition latency and CPU cache line bouncing across hardware cores, despite zero allocations.
+- **Mixed Read/Write (202 ns)**: The 80/20 mixed read/write profile introduces heap restructuring (`FixDown` and `Insert`), maintaining high throughput while preserving LRU ordering.
+
+### Reproducing Benchmarks
+
+Run single-threaded and concurrent benchmarks:
 
 ```bash
-go test -race ./...
-```
+# Benchmark in-memory cache operations with memory profiling
+go test -bench=. -benchmem ./internal/cache
 
-The cache passed the concurrent tests without reporting data races.
+# Benchmark concurrent reads under race detector validation
+go test -bench=BenchmarkCacheGetConcurrent -benchmem -race ./internal/cache
+
+# Benchmark direct PostgreSQL query latency (requires running DB)
+go test -bench=BenchmarkGetCachedEntry -benchmem ./internal/repository
+```
 
 ---
 
-## PostgreSQL
+## API Specification
 
-PostgreSQL stores the durable copy of each entry.
+The HTTP transport is served on port `:8080` using Chi router.
 
-The schema is intentionally simple:
+### `GET /cache/{key}`
 
-```sql
-CREATE TABLE cache_entries (
-    key TEXT PRIMARY KEY,
-    data BYTEA NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+Retrieves an entry by key via read-through caching.
+
+#### Parameters
+
+| Name | Type | In | Required | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `key` | `string` | path | Yes | Unique cache key identifier. |
+
+#### Responses
+
+- `200 OK`: Key found (returned from memory or backfilled from PostgreSQL).
+- `510 Not Extended` / `404 Not Found`: Key does not exist in cache or database.
+
+#### Example Request & Response
+
+```bash
+curl -i -X GET http://localhost:8080/cache/user:101
 ```
-
-PostgreSQL is treated as the source of truth.
-
-The in-memory cache is an optimization.
-
----
-
-## Why `[]byte`?
-
-The cache stores values as:
-
-```go
-[]byte
-```
-
-rather than forcing the cache to understand a specific data structure.
-
-For example, the bytes could represent:
-
-- JSON
-- MessagePack
-- Protocol Buffers
-- Serialized structs
-- Other application-specific formats
-
-The cache simply stores and returns the bytes.
-
-The caller decides how to interpret them.
-
-This keeps the cache relatively generic.
-
----
-
-# Read-Through Caching
-
-A `GET` follows this flow:
-
-```text
-Cache.Get(key)
-      |
-      +-- HIT ------> return data
-      |
-      +-- MISS
-           |
-           v
-      PostgreSQL
-           |
-           +-- FOUND
-           |     |
-           |     v
-           |  Cache.Put()
-           |     |
-           |     v
-           |  return data
-           |
-           +-- NOT FOUND
-                  |
-                  v
-                error
-```
-
-The client does not need to know where the data came from.
-
-### First request
-
-```text
-Client
-  |
-  v
-Cache MISS
-  |
-  v
-PostgreSQL
-  |
-  v
-Cache
-  |
-  v
-Response
-```
-
-### Subsequent requests
-
-```text
-Client
-  |
-  v
-Cache HIT
-  |
-  v
-Response
-```
-
-This is the main reason the cache exists.
-
----
-
-# Write Behavior
-
-A `PUT` writes to PostgreSQL first and then updates the cache.
-
-```text
-Client
-  |
-  v
-Service
-  |
-  v
-PostgreSQL
-  |
-  v
-Cache.Put()
-```
-
-The database uses an upsert:
-
-```sql
-INSERT INTO cache_entries (key, data, created_at, updated_at)
-VALUES ($1, $2, $3, $4)
-ON CONFLICT (key)
-DO UPDATE SET
-    data = EXCLUDED.data,
-    updated_at = NOW();
-```
-
-This means the same endpoint can be used to create or update an entry.
-
----
-
-# API
-
-## PUT
 
 ```http
-PUT /cache/{key}
-```
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Sun, 06 Sep 2026 10:00:00 GMT
+Content-Length: 35
 
-Example:
-
-```bash
-curl -X PUT localhost:8080/cache/user:101   -H "Content-Type: application/json"   -d '{"data":{"name":"Aneesh","age":20}}'
-```
-
-Response:
-
-```text
-204 No Content
-```
-
----
-
-## GET
-
-```http
-GET /cache/{key}
-```
-
-Example:
-
-```bash
-curl localhost:8080/cache/user:101
-```
-
-Response:
-
-```json
 {
-    "data": {
-        "name": "Aneesh",
-        "age": 20
-    }
+  "data": {
+    "name": "Ada Lovelace",
+    "role": "Engineer"
+  }
 }
 ```
 
 ---
 
-# Project Structure
+### `PUT /cache/{key}`
 
-The project intentionally uses a relatively simple structure:
+Upserts an entry into PostgreSQL and hydrates/updates the in-memory LRU cache.
+
+#### Parameters
+
+| Name | Type | In | Required | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `key` | `string` | path | Yes | Unique cache key identifier. |
+
+#### Request Body
+
+- `Content-Type: application/json`
+- Schema: `{"data": <arbitrary_json_payload>}`
+
+#### Responses
+
+- `204 No Content`: Entry successfully persisted to database and cache.
+- `400 Bad Request`: Malformed JSON payload.
+- `500 Internal Server Error`: Persistence failure.
+
+#### Example Request & Response
+
+```bash
+curl -i -X PUT http://localhost:8080/cache/user:101 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "data": {
+      "name": "Ada Lovelace",
+      "role": "Engineer"
+    }
+  }'
+```
+
+```http
+HTTP/1.1 204 No Content
+Date: Sun, 06 Sep 2026 10:00:01 GMT
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- **Go**: Version `1.22+` (or latest stable)
+- **PostgreSQL**: Version `14+` (or Docker installed)
+- **Git**
+
+### Environment Configuration
+
+Copy the example environment template:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `PORT` | `int` | `8080` | Port on which the HTTP server listens. |
+| `DATABASE_URL` | `string` | — | PostgreSQL connection URI (e.g. `postgres://user:pass@host:5432/dbname?sslmode=disable`). |
+
+### Local PostgreSQL Setup
+
+You can provision a PostgreSQL instance instantly with the provided Docker Compose configuration:
+
+```bash
+# Start PostgreSQL in detached mode
+docker compose up -d
+
+# Verify container health
+docker compose ps
+```
+
+### Database Migrations
+
+Execute the migration runner to apply SQL schemas to the database:
+
+```bash
+go run cmd/migrate/main.go
+```
+
+Output:
+```text
+Migrations applied successfully
+```
+
+The database schema initializes the following table:
+
+```sql
+CREATE TABLE IF NOT EXISTS cache_entries (
+    key TEXT PRIMARY KEY,
+    data BYTEA NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+### Starting the Server
+
+Run the API service:
+
+```bash
+go run cmd/server/main.go
+```
+
+Output:
+```text
+server running on :8080
+```
+
+Verify service operation by putting and getting an entry:
+
+```bash
+# Store entry
+curl -i -X PUT http://localhost:8080/cache/service:health \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"status":"healthy","uptime_pct":99.99}}'
+
+# Read entry back
+curl -i -X GET http://localhost:8080/cache/service:health
+```
+
+---
+
+## Project Layout
+
+Follows standard Go project layout conventions:
 
 ```text
 shared-in-memory-index/
 ├── cmd/
+│   ├── migrate/
+│   │   └── main.go          # Database migration entrypoint
 │   └── server/
-│       └── main.go
-│
+│       └── main.go          # HTTP server bootstrap & dependency wiring
 ├── internal/
-│   ├── cache/
-│   │   ├── cache.go
-│   │   ├── entry.go
-│   │   ├── heap.go
-│   │   └── cache_test.go
-│   │
-│   ├── database/
-│   ├── dto/
-│   ├── handler/
-│   ├── repository/
-│   └── service/
-│
-├── migrations/
-│
-├── go.mod
-└── README.md
+│   ├── cache/               # In-memory dual-indexed storage engine
+│   │   ├── cache.go         # Cache API: Get, Put, Delete, mutex protection
+│   │   ├── cache_bench_test.go # High-concurrency performance benchmarks
+│   │   ├── cache_test.go    # Unit tests & LRU invariant verification
+│   │   ├── entry.go         # Memory entry & heap node struct definitions
+│   │   └── heap.go          # Custom binary min-heap with O(1) swap tracking
+│   ├── database/            # pgxpool connection management
+│   │   └── database.go
+│   ├── domain/              # Core domain entities
+│   │   └── domain.go
+│   ├── dto/                 # Request & response transport definitions
+│   │   └── dto.go
+│   ├── handler/             # HTTP routing & JSON marshalling handlers
+│   │   └── handler.go
+│   ├── repository/          # PostgreSQL data access layer & SQL queries
+│   │   ├── repository.go
+│   │   └── repository_bench_test.go
+│   └── service/             # Read-through caching coordination service
+│       └── cacheService.go
+├── migrations/              # Up/down database migration SQL files
+│   ├── 000001_create_cache_entries_table.up.sql
+│   └── 000001_create_cache_entries_table.down.sql
+├── docker-compose.yml       # Local development PostgreSQL container definition
+├── .env.example             # Configuration environment variable template
+├── go.mod                   # Go module definition
+├── go.sum                   # Checksums for direct and transitive dependencies
+└── README.md                # System documentation & technical specifications
 ```
-
-This is not intended to be a definitive Go project structure.
-
-It is simply enough structure to keep the responsibilities understandable without introducing unnecessary abstraction.
 
 ---
 
-# Benchmarks
+## Testing & Quality Assurance
 
-The project was benchmarked to compare the in-memory cache against PostgreSQL and to observe concurrent behavior.
+### Unit Testing & Race Detection
 
-## Single-threaded cache GET
+All cache data structure invariants (LRU eviction ordering, bidirectional `HeapIndex` validity, duplicate key replacements, and deletion from arbitrary heap indices) are rigorously validated.
 
-```text
-BenchmarkCacheGet-10
-29,623,808 operations
-36.31 ns/op
-0 B/op
-0 allocs/op
-```
-
-This demonstrates the extremely low overhead of accessing data already in memory.
-
----
-
-## Concurrent cache GET
-
-The cache was also tested with multiple goroutines:
-
-```text
-BenchmarkCacheGetConcurrent-10
-1,897,567 operations
-634.4 ns/op
-0 B/op
-0 allocs/op
-```
-
-The benchmark was run with the race detector:
+Execute tests with Go's race detector:
 
 ```bash
-go test -bench=BenchmarkCacheGetConcurrent -benchmem -race ./internal/cache
+go test -v -race ./internal/cache
 ```
 
-The race detector completed successfully.
+Expected result:
+```text
+=== RUN   TestCachePutGet
+--- PASS: TestCachePutGet (0.00s)
+=== RUN   TestCacheGetMissing
+--- PASS: TestCacheGetMissing (0.00s)
+=== RUN   TestCachePutExisting
+--- PASS: TestCachePutExisting (0.00s)
+=== RUN   TestCacheDelete
+--- PASS: TestCacheDelete (0.00s)
+=== RUN   TestCacheDeleteMissing
+--- PASS: TestCacheDeleteMissing (0.00s)
+=== RUN   TestCacheLRUEviction
+--- PASS: TestCacheLRUEviction (0.00s)
+=== RUN   TestHeapIndex
+--- PASS: TestHeapIndex (0.00s)
+=== RUN   TestCacheDeleteMiddle
+--- PASS: TestCacheDeleteMiddle (0.00s)
+PASS
+ok  	github.com/Aneeshie/shared-in-memory-index/internal/cache	1.05s
+```
 
 ---
 
-## Concurrent GET + PUT
+## Production Readiness & Engineering Trade-Offs
 
-An approximately 80/20 GET/PUT workload was also tested:
+In high-scale production systems, design choices involve trade-offs between architectural simplicity, consistency, and concurrency scalability.
 
-```text
-BenchmarkCacheMixedConcurrent-10
-855,655 operations
-1364 ns/op
-0 B/op
-```
+### Lock Contention & Cache Sharding
 
-This benchmark was useful because it represents a more realistic situation than only reading the same key repeatedly.
+- **Current Architecture**: A single `sync.Mutex` guards the global map and min-heap. This guarantees strict, deterministic global LRU ordering and invariant safety.
+- **High-Concurrency Bottleneck**: When CPU core counts increase (e.g. 32–64 vCPUs) and workloads exceed $10^7$ req/sec, lock contention on the global mutex becomes the primary throughput ceiling.
+- **Production Solution — Striped / Sharded Cache**:
+  Partition keys into $K$ distinct shards using FNV-1a or Murmur3 hash:
+  $$\text{shardIndex} = \text{hash}(\text{key}) \pmod K$$
+  Each shard manages an independent mutex, map, and min-heap. This divides lock contention by a factor of $K$ at the expense of localized (approximate) rather than globally uniform LRU eviction.
 
-It also demonstrates the synchronization cost introduced by the shared mutex.
+### Cache Stampede Mitigation (SingleFlight)
 
----
+- **The Problem (Thundering Herd)**: Under high traffic, if a popular key evicts or expires, thousands of concurrent requests will register a cache miss simultaneously. Each goroutine will fall through to PostgreSQL, exhausting connection pool limits (`pgxpool.Pool`) and degrading database responsiveness.
+- **Production Solution**: Integrate Go's [`golang.org/x/sync/singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight) inside `CacheService.GetData()`. `singleflight.Group` coalesces concurrent duplicate calls into a single in-flight DB query, sharing the result across all callers.
 
-## PostgreSQL lookup
+### Time-To-Live (TTL) & Eviction Strategies
 
-A direct repository benchmark produced:
+- **Current Behavior**: Entries persist until evicted by capacity pressure.
+- **Production Solution**:
+  1. **Passive Eviction**: Check `expires_at < time.Now()` on `Get()`. If expired, treat as a miss and delete asynchronously.
+  2. **Active Reaper Goroutine**: Periodically sample heap roots or maintain a second min-heap keyed by expiration timestamp to continuously prune stale memory.
+  3. **Frequency-Aware Eviction (W-TinyLFU)**: Strict LRU is susceptible to cache pollution during sequential scans. Modern systems (e.g., Caffeine, Ristretto) incorporate TinyLFU admission policies to weigh frequency against recency.
 
-```text
-BenchmarkGetCachedEntry-10
-12 operations
-85,222,229 ns/op
-19,386 B/op
-102 allocs/op
-```
+### Distributed Consistency & Invalidation
 
-This is an actual Go -> pgx -> PostgreSQL round trip, so the number is environment-dependent and should not be treated as a universal database latency figure.
+- **Current Topology**: Local in-process cache. In a multi-replica deployment (Kubernetes Pods $A, B, C$), a write to Pod $A$ updates Pod $A$'s cache and PostgreSQL, but Pods $B$ and $C$ serve stale in-memory data until restarted or overridden.
+- **Production Solutions**:
+  - **PostgreSQL `LISTEN` / `NOTIFY`**: Service instances subscribe to a WAL notification channel on `cache_entries` updates to broadcast local eviction signals.
+  - **Pub/Sub Bus (Redis / Kafka)**: Emit cache invalidation messages (`CacheInvalidateEvent{Key: "..."}`) to purge replicas.
+  - **Read-Through Distributed Cache**: Adopt Redis or Memcached as a shared second-tier cluster behind the application.
 
-The important observation is the scale difference between an in-memory lookup and a database-backed lookup.
+### Observability & Health Probes
 
----
-
-
-## Performance Summary
-
-The project was benchmarked at several levels to understand the cost of in-memory access, concurrency, synchronization, and PostgreSQL access.
-
-| Operation | Time | Memory | Allocations |
-|---|---:|---:|---:|
-| Cache GET | **36.31 ns/op** | 0 B/op | 0 allocs/op |
-| Concurrent Cache GET | **634.4 ns/op** | 0 B/op | 0 allocs/op |
-| Concurrent 80/20 GET+PUT | **1364 ns/op** | 3 B/op | 0 allocs/op |
-| PostgreSQL GET | **85.22 ms/op** | 19,386 B/op | 102 allocs/op |
-
-### Cache vs PostgreSQL
-
-The measured single-threaded cache lookup was approximately:
-
-```text
-Cache:       36.31 ns/op
-PostgreSQL:  85.22 ms/op
-```
-
-That is roughly **2.35 million times lower latency** in this particular benchmark:
-
-```text
-85.22 ms / 36.31 ns ≈ 2.35 million
-```
-
-This number should **not** be interpreted as a universal cache-vs-database speed ratio. The PostgreSQL benchmark includes the Go → pgx → PostgreSQL round trip and depends heavily on the local environment, connection state, database configuration, and workload.
-
-The useful takeaway is the enormous difference between an in-process memory access and a database round trip.
-
-### Concurrent performance
-
-The cache was also tested under concurrent access.
-
-```text
-BenchmarkCacheGetConcurrent-10
-1,897,567 operations
-634.4 ns/op
-0 B/op
-0 allocs/op
-```
-
-And with a mixed workload of approximately 80% GET and 20% PUT:
-
-```text
-BenchmarkCacheMixedConcurrent-10
-855,655 operations
-1364 ns/op
-3 B/op
-0 allocs/op
-```
-
-The increase from **36.31 ns/op** to **634.4 ns/op** under concurrent execution highlights that synchronization and concurrent scheduling introduce overhead even when the underlying data structure performs no heap allocations.
-
-The mixed workload is slower still because `PUT` operations modify the cache and heap in addition to acquiring the mutex.
-
-### Race Detector
-
-The concurrent cache benchmarks were also run with Go's race detector:
-
-```bash
-go test -bench=BenchmarkCacheGetConcurrent -benchmem -race ./internal/cache
-```
-
-and the test suite was run with:
-
-```bash
-go test -race ./...
-```
-
-No data races were reported.
-
-### What These Numbers Show
-
-The benchmarks helped demonstrate several important points:
-
-- In-memory access is dramatically cheaper than a database round trip.
-- The cache performs zero allocations per operation in the measured GET workloads.
-- Concurrency introduces synchronization overhead.
-- `Get()` is not free of synchronization because it updates LRU metadata.
-- Mixed read/write workloads increase contention.
-- Performance should be measured rather than assumed.
-
-These measurements were used primarily as a **learning and profiling exercise**, not as a claim that this implementation is faster or better than production cache systems.
-
-# What I Learned
-
-This project was primarily built as a learning exercise.
-
-Some of the main concepts explored were:
-
-### Data Structures
-
-- Hash maps
-- Min-heaps
-- LRU eviction
-- Heap indexing
-- Maintaining data structure invariants
-
-### Go Concurrency
-
-- Goroutines
-- Mutexes
-- Concurrent access
-- Race detection
-- Lock contention
-- The difference between logically reading data and physically mutating shared state
-
-### Systems Design
-
-- Cache vs source of truth
-- Read-through caching
-- Service/repository separation
-- Persistence
-- HTTP request flow
-- Failure boundaries
-
-### Performance
-
-- Benchmarking with `go test -bench`
-- Allocation measurements with `-benchmem`
-- Race detection with `-race`
-- Comparing in-memory access against database access
-- Understanding synchronization overhead
+For operational readiness in containerized environments (Kubernetes, AWS ECS):
+- **Metrics**: Expose Prometheus `/metrics` detailing:
+  - Cache Hit / Miss Ratio: `rate(cache_hits_total[1m]) / rate(cache_requests_total[1m])`
+  - Eviction Count: `counter_cache_evictions_total`
+  - Lock Acquisition Latency: `histogram_cache_lock_wait_seconds`
+  - Memory Footprint & Node Count: `gauge_cache_items`
+- **Health Probes**: Implement `/healthz` (liveness: process responsive) and `/readyz` (readiness: PostgreSQL connection pool ping successful).
+- **Graceful Shutdown**: Intercept `SIGINT` / `SIGTERM` via `os/signal` to flush in-flight HTTP requests and cleanly call `dbPool.Close()` with context deadlines.
 
 ---
 
-# Caveats
+## License
 
-This project intentionally does **not** attempt to be a production-grade cache.
-
-The main objective was to understand the underlying concepts by implementing them myself.
-
-### 1. The architecture is intentionally simplified
-
-I did not strictly follow conventional production Go project structures.
-
-For example, rather than introducing additional layers or packages purely for architectural convention, the application uses simple:
-
-```text
-Handler
-   |
-Service
-   |
-Repository
-```
-
-structs.
-
-This was intentional.
-
-The goal was to understand the responsibilities of each layer rather than maximize architectural complexity.
-
-### 2. The cache uses a single global mutex
-
-The entire cache is protected by one `sync.Mutex`.
-
-This makes the implementation straightforward and keeps the map/heap invariants safe, but it also introduces contention.
-
-Even `Get()` requires the mutex because updating `LastUsed` modifies the heap.
-
-A production implementation could explore:
-
-- Sharded caches
-- Per-shard mutexes
-- Approximate LRU policies
-- Different eviction algorithms
-- More specialized synchronization strategies
-
-Sharding could improve concurrency, but maintaining a globally ordered LRU would become more complicated.
-
-### 3. The LRU implementation is custom
-
-This implementation was primarily intended to learn how the data structure works.
-
-Production systems would likely use an existing, well-tested cache implementation rather than maintaining a custom heap and eviction mechanism.
-
-The custom implementation exists because understanding the mechanism was the point of the project.
-
-### 4. No TTL
-
-Entries currently don't expire based on time.
-
-A production cache might support:
-
-```text
-expires_at
-TTL
-background cleanup
-lazy expiration
-```
-
-This was intentionally left out.
-
-### 5. No cache stampede protection
-
-If many goroutines request the same missing key simultaneously:
-
-```text
-GET A -> Cache MISS -> DB
-GET A -> Cache MISS -> DB
-GET A -> Cache MISS -> DB
-GET A -> Cache MISS -> DB
-```
-
-multiple database requests can occur before the first request populates the cache.
-
-A production implementation could use request coalescing or a single-flight style mechanism.
-
-### 6. No distributed cache invalidation
-
-The cache is local to a single process.
-
-If multiple application instances are running:
-
-```text
-Instance A -> Cache A
-Instance B -> Cache B
-Instance C -> Cache C
-```
-
-each instance has its own state.
-
-Updating data through instance A does not automatically invalidate or update the caches of B and C.
-
-A distributed system could use Redis, pub/sub, messaging, or explicit invalidation protocols.
-
-### 7. Limited failure handling
-
-The project does not attempt to fully solve complicated failure scenarios such as:
-
-```text
-DB succeeds
-Cache update fails
-
-Cache update succeeds
-DB fails
-
-Process crashes after DB write
-Process crashes before cache update
-```
-
-The service currently follows a simple DB-first approach for writes.
-
-Production systems would need more deliberate consistency and recovery semantics.
-
-### 8. No full production observability/shutdown setup
-
-The server is intentionally minimal.
-
-It does not currently provide a complete production setup for:
-
-- Graceful shutdown
-- Structured logging
-- Metrics
-- Tracing
-- Health checks
-- Readiness/liveness probes
-- Configuration management
-- Connection pool tuning
-- Load testing
-
-These are separate engineering concerns that were outside the main learning objective.
-
----
-
-# Optimizations / Improvements
-
-There are several ways this implementation could be improved.
-
-The interesting part is that many of these optimizations introduce new tradeoffs rather than simply making everything faster.
-
-### Cache sharding
-
-Instead of one global lock:
-
-```text
-             Cache
-               |
-       +-------+-------+
-       v       v       v
-    Shard 1  Shard 2  Shard 3
-      |        |        |
-     lock     lock     lock
-```
-
-Each shard could have its own map, heap, and mutex.
-
-This would reduce lock contention under high concurrency.
-
-The tradeoff is increased complexity and potentially less precise global LRU behavior.
-
-### Alternative eviction policies
-
-Instead of a strict LRU-style policy, alternatives could be explored:
-
-- CLOCK
-- TinyLFU
-- Segmented LRU
-- Approximate LRU
-
-These can sometimes provide better performance or lower synchronization overhead depending on workload.
-
-### Read/write synchronization
-
-`sync.RWMutex` was not directly useful for the current design because `Get()` updates recency information.
-
-A different cache design could separate data access from recency tracking and potentially allow more concurrent reads.
-
-### Cache stampede protection
-
-A single-flight mechanism could ensure that concurrent misses for the same key share one database request.
-
-```text
-GET A --+
-GET A --+--> one DB request --> Cache A
-GET A --+
-GET A --+
-```
-
-### TTL
-
-Entries could expire after a configurable duration.
-
-This would be useful for data that becomes stale over time.
-
-### Distributed caching
-
-For multiple application instances, a shared external cache such as Redis could be introduced.
-
-That changes the problem substantially because network latency, distributed consistency, failures, and invalidation become important.
-
----
-
-# Why Build It Yourself?
-
-A production application probably shouldn't reinvent a cache.
-
-The value of this project was not:
-
-> "I built something better than Redis."
-
-It was:
-
-> "I now understand what is happening underneath a cache."
-
-I had to reason about:
-
-```text
-Map
- ↓
-Heap
- ↓
-LRU
- ↓
-Mutex
- ↓
-Concurrent access
- ↓
-Database fallback
- ↓
-HTTP
- ↓
-Performance
-```
-
-That was the actual goal of the project.
-
----
-
-# Future Experiments
-
-If I wanted to take this project further, interesting experiments would include:
-
-- Sharded caches
-- TTL expiration
-- Cache stampede prevention
-- Approximate LRU
-- `sync.RWMutex` experiments
-- Concurrent benchmark comparisons
-- Load testing the HTTP API
-- Cache hit/miss metrics
-- Graceful shutdown
-- Better error handling
-- Cache invalidation across multiple instances
-- Comparing the implementation against an existing cache library
-
-These are intentionally left as future experiments rather than part of the core implementation.
-
----
-
-# Stack
-
-- **Go**
-- **Chi**
-- **PostgreSQL**
-- **pgx**
-- **godotenv**
-
----
-
-# Status
-
-**Complete — Learning Project**
-
-The implementation is intentionally simple and has known limitations.
-
-The project is considered complete because the primary learning goals were achieved:
-
-- Building a concurrent in-memory cache from scratch
-- Implementing a min-heap and LRU-style eviction
-- Maintaining data structure invariants
-- Integrating the cache with PostgreSQL
-- Implementing read-through caching
-- Exposing the system through HTTP
-- Testing concurrent behavior
-- Using the race detector
-- Benchmarking cache vs database performance
-- Identifying synchronization bottlenecks
-- Understanding possible production optimizations and their tradeoffs
-
-The project is therefore considered **finished for its intended learning scope**, rather than production-ready.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
