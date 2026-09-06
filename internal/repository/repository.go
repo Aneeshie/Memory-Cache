@@ -23,10 +23,14 @@ func NewRepository(db *pgxpool.Pool) *Repository {
 
 func (r *Repository) CreateCachedEntry(ctx context.Context, entry *domain.CachedEntry) error {
 	query := `INSERT INTO cache_entries (key, data, created_at, updated_at)
-	VALUES($1,$2,$3);
+	VALUES($1,$2,$3)
+	ON CONFLICT (key)
+	DO UPDATE SET 
+		data = EXCLUDED.data,
+		updated_at = NOW();
 	`
 
-	if _, err := r.db.Exec(ctx, query, entry.Data, entry.Key, entry.CreatedAt, entry.UpdatedAt); err != nil {
+	if _, err := r.db.Exec(ctx, query, entry.Key, entry.Data, entry.CreatedAt, entry.UpdatedAt); err != nil {
 		return err
 	}
 
